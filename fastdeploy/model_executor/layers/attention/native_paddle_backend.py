@@ -36,31 +36,8 @@ class PaddleNativeAttnBackend(AttentionBackend):
     Which is used only for testing purpose.
     """
 
-    def __init__(
-        self,
-        fd_config=None,
-        kv_num_heads: int = None,
-        num_heads: int = None,
-        head_dim: int = None,
-        encoder_block_shape_q: int = -1,
-        decoder_block_shape_q: int = -1,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._kv_num_heads = kv_num_heads or 8
-        self._head_dim = head_dim or 128
-        self._block_size = 64
-        if fd_config is not None:
-            self._block_size = fd_config.cache_config.block_size
-
-    def get_kv_cache_shape(
-        self,
-        max_num_blocks: int,
-        kv_cache_quant_type: str = None,
-    ):
-        """Calculate KV cache shape."""
-        key_cache_shape = [max_num_blocks, self._kv_num_heads, self._block_size, self._head_dim]
-        value_cache_shape = key_cache_shape
-        return key_cache_shape, value_cache_shape
 
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Init the metadata for a forward pass."""
@@ -241,9 +218,6 @@ class PaddleNativeAttnBackend(AttentionBackend):
         q: paddle.Tensor,
         k: paddle.Tensor,
         v: paddle.Tensor,
-        qkv: paddle.Tensor,
-        compressed_kv: paddle.Tensor,
-        k_pe: paddle.Tensor,
         layer: paddle.nn.Layer,
         forward_meta: ForwardMeta,
         save_kv_cache: bool = True,
@@ -251,20 +225,16 @@ class PaddleNativeAttnBackend(AttentionBackend):
         """
         Run the prefill and extend(prompt cache) attention forward by using paddle native sdpa op.
         """
-        # If q is None, split from qkv tensor
-        if q is None and qkv is not None:
-            q, k, v = self._split_qkv(qkv, layer)
-
         if layer.qk_head_dim != layer.v_head_dim:
-            o = paddle.empty((q.shape[0], layer.num_heads * layer.v_head_dim), dtype=q.dtype)
+            o = q.new_empty((q.shape[0], layer.self.num_heads * layer.v_head_dim))
         else:
             o = paddle.empty_like(q)
 
         if save_kv_cache:
             forward_meta.token_to_kv_pool.set_kv_buffer(layer, forward_meta.out_cache_loc, k, v)
 
-        q_ = q.reshape([-1, layer.num_heads, layer.qk_head_dim])
-        o_ = o.reshape([-1, layer.num_heads, layer.v_head_dim])
+        q_ = q.view([-1, layer.self.num_heads, layer.qk_head_dim])
+        o_ = o.view([-1, layer.self.num_heads, layer.v_head_dim])
 
         causal = True
 
@@ -282,61 +252,28 @@ class PaddleNativeAttnBackend(AttentionBackend):
         )
         return o
 
-    def _split_qkv(
-        self,
-        qkv: paddle.Tensor,
-        layer: paddle.nn.Layer,
-    ):
-        """
-        Split fused QKV tensor into separate Q, K, V tensors.
-
-        Args:
-            qkv: Fused QKV tensor of shape [num_tokens, (num_heads + 2 * kv_num_heads) * head_dim]
-            layer: Attention layer containing num_heads, kv_num_heads, head_dim info
-
-        Returns:
-            q: Query tensor [num_tokens, num_heads * head_dim]
-            k: Key tensor [num_tokens, kv_num_heads * head_dim]
-            v: Value tensor [num_tokens, kv_num_heads * head_dim]
-        """
-        q_size = layer.num_heads * layer.qk_head_dim
-        kv_size = layer.kv_num_heads * layer.qk_head_dim
-
-        q = qkv[:, :q_size]
-        k = qkv[:, q_size : q_size + kv_size]
-        v = qkv[:, q_size + kv_size :]
-
-        return q, k, v
-
     def forward_decode(
         self,
         q: paddle.Tensor,
         k: paddle.Tensor,
         v: paddle.Tensor,
-        qkv: paddle.Tensor,
-        compressed_kv: paddle.Tensor,
-        k_pe: paddle.Tensor,
         layer: paddle.nn.Layer,
         forward_meta: ForwardMeta,
     ) -> paddle.Tensor:
         """
         Run the decoding attention forward by using paddle native sdpa op.
         """
-        # If q is None, split from qkv tensor
-        if q is None and qkv is not None:
-            q, k, v = self._split_qkv(qkv, layer)
-
-        q = q.reshape([-1, layer.num_heads * layer.qk_head_dim])
+        q = q.reshape([-1, layer.self.num_heads * layer.qk_head_dim])
 
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.num_heads * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.self.num_heads * layer.v_head_dim))
         else:
             o = paddle.empty_like(q)
 
         forward_meta.token_to_kv_pool.set_kv_buffer(layer, forward_meta.out_cache_loc, k, v)
 
-        q_ = q.reshape([-1, layer.num_heads, layer.qk_head_dim])
-        o_ = o.reshape([-1, layer.num_heads, layer.v_head_dim])
+        q_ = q.view([-1, layer.self.num_heads, layer.qk_head_dim])
+        o_ = o.view([-1, layer.self.num_heads, layer.v_head_dim])
 
         self._run_sdpa_forward_decode(
             q_,
@@ -350,20 +287,3 @@ class PaddleNativeAttnBackend(AttentionBackend):
         )
 
         return o
-
-    def forward_mixed(
-        self,
-        q: paddle.Tensor,
-        k: paddle.Tensor,
-        v: paddle.Tensor,
-        qkv: paddle.Tensor,
-        compressed_kv: paddle.Tensor,
-        k_pe: paddle.Tensor,
-        layer: paddle.nn.Layer,
-        forward_meta: ForwardMeta,
-    ) -> paddle.Tensor:
-        """
-        Run the mixed (prefill + decode) attention forward by using paddle native sdpa op.
-        For V100 and other SM70 GPUs, this delegates to forward_extend.
-        """
-        return self.forward_extend(q, k, v, qkv, compressed_kv, k_pe, layer, forward_meta, save_kv_cache=True)
