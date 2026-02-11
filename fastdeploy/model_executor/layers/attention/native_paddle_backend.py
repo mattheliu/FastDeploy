@@ -251,8 +251,12 @@ class PaddleNativeAttnBackend(AttentionBackend):
         """
         Run the prefill and extend(prompt cache) attention forward by using paddle native sdpa op.
         """
+        # If q is None, split from qkv tensor
+        if q is None and qkv is not None:
+            q, k, v = self._split_qkv(qkv, layer)
+
         if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.num_heads * layer.v_head_dim))
+            o = paddle.empty((q.shape[0], layer.num_heads * layer.v_head_dim), dtype=q.dtype)
         else:
             o = paddle.empty_like(q)
 
@@ -278,6 +282,32 @@ class PaddleNativeAttnBackend(AttentionBackend):
         )
         return o
 
+    def _split_qkv(
+        self,
+        qkv: paddle.Tensor,
+        layer: paddle.nn.Layer,
+    ):
+        """
+        Split fused QKV tensor into separate Q, K, V tensors.
+
+        Args:
+            qkv: Fused QKV tensor of shape [num_tokens, (num_heads + 2 * kv_num_heads) * head_dim]
+            layer: Attention layer containing num_heads, kv_num_heads, head_dim info
+
+        Returns:
+            q: Query tensor [num_tokens, num_heads * head_dim]
+            k: Key tensor [num_tokens, kv_num_heads * head_dim]
+            v: Value tensor [num_tokens, kv_num_heads * head_dim]
+        """
+        q_size = layer.num_heads * layer.qk_head_dim
+        kv_size = layer.kv_num_heads * layer.qk_head_dim
+
+        q = qkv[:, :q_size]
+        k = qkv[:, q_size : q_size + kv_size]
+        v = qkv[:, q_size + kv_size :]
+
+        return q, k, v
+
     def forward_decode(
         self,
         q: paddle.Tensor,
@@ -292,6 +322,10 @@ class PaddleNativeAttnBackend(AttentionBackend):
         """
         Run the decoding attention forward by using paddle native sdpa op.
         """
+        # If q is None, split from qkv tensor
+        if q is None and qkv is not None:
+            q, k, v = self._split_qkv(qkv, layer)
+
         q = q.reshape([-1, layer.num_heads * layer.qk_head_dim])
 
         if layer.qk_head_dim != layer.v_head_dim:
