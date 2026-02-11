@@ -449,9 +449,12 @@ class V100FlashAttentionBackend(AttentionBackend):
         )
 
         # Step 3: Read all KV from cache
-        batch_size = forward_meta.seq_lens_encoder.shape[0]
+        # Use seq_lens_this_time.shape[0] as batch_size to ensure consistency
+        batch_size = forward_meta.seq_lens_this_time.shape[0]
         total_seq_lens = (
-            forward_meta.seq_lens_encoder + forward_meta.seq_lens_decoder + forward_meta.seq_lens_this_time
+            forward_meta.seq_lens_encoder[:batch_size]
+            + forward_meta.seq_lens_decoder[:batch_size]
+            + forward_meta.seq_lens_this_time
         )
 
         k_list, v_list, seq_lens_list, batch_ids = self._read_kv_from_block_cache(
