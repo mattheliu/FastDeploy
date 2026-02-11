@@ -284,10 +284,12 @@ class V100FlashAttentionBackend(AttentionBackend):
             k_list: List of key tensors per batch [seq_len, kv_num_heads, head_dim]
             v_list: List of value tensors per batch [seq_len, kv_num_heads, head_dim]
             seq_lens_list: List of sequence lengths
+            batch_ids: List of original batch IDs (for sequences with seq_len > 0)
         """
         k_list = []
         v_list = []
         seq_lens_list = []
+        batch_ids = []
 
         for batch_id in range(batch_size):
             seq_len = int(total_seq_lens[batch_id].item())
@@ -295,6 +297,7 @@ class V100FlashAttentionBackend(AttentionBackend):
                 continue
 
             seq_lens_list.append(seq_len)
+            batch_ids.append(batch_id)
             num_blocks = (seq_len + self.block_size - 1) // self.block_size
 
             k_seq = []
@@ -322,7 +325,7 @@ class V100FlashAttentionBackend(AttentionBackend):
             k_list.append(paddle.concat(k_seq, axis=0))
             v_list.append(paddle.concat(v_seq, axis=0))
 
-        return k_list, v_list, seq_lens_list
+        return k_list, v_list, seq_lens_list, batch_ids
 
     def _scaled_dot_product_attention_per_seq(
         self,
@@ -451,7 +454,7 @@ class V100FlashAttentionBackend(AttentionBackend):
             forward_meta.seq_lens_encoder + forward_meta.seq_lens_decoder + forward_meta.seq_lens_this_time
         )
 
-        k_list, v_list, seq_lens_list = self._read_kv_from_block_cache(
+        k_list, v_list, seq_lens_list, batch_ids = self._read_kv_from_block_cache(
             key_cache,
             value_cache,
             forward_meta.block_tables,
@@ -468,9 +471,9 @@ class V100FlashAttentionBackend(AttentionBackend):
         output_list = []
         token_start = 0
 
-        for batch_idx, (k_seq, v_seq, kv_len) in enumerate(zip(k_list, v_list, seq_lens_list)):
-            # Get Q for this sequence
-            q_len = int(forward_meta.seq_lens_this_time[batch_idx].item())
+        for k_seq, v_seq, kv_len, batch_id in zip(k_list, v_list, seq_lens_list, batch_ids):
+            # Get Q for this sequence using original batch_id
+            q_len = int(forward_meta.seq_lens_this_time[batch_id].item())
             if q_len == 0:
                 continue
 
