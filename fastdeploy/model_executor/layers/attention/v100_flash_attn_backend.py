@@ -304,11 +304,10 @@ class V100FlashAttentionBackend(AttentionBackend):
             # For each pair (x_even, x_odd), apply rotation:
             # x_even_new = x_even * cos - x_odd * sin
             # x_odd_new = x_odd * cos + x_even * sin
-            # cos/sin have shape [num_tokens, 1, head_dim], take every other element
-
-            # cos_expanded shape: [num_tokens, 1, head_dim]
-            cos_even = cos_expanded[:, :, 0::2]  # [num_tokens, 1, head_dim//2]
-            sin_even = sin_expanded[:, :, 0::2]  # [num_tokens, 1, head_dim//2]
+            #
+            # rotary_embs already has shape [2, 1, max_seq_len, 1, head_dim//2]
+            # so cos_expanded/sin_expanded are [num_tokens, 1, head_dim//2]
+            # which matches q_even/q_odd shape [num_tokens, num_heads, head_dim//2]
 
             # Split Q and K into even and odd parts
             q_even = q[:, :, 0::2]  # [num_tokens, num_heads, head_dim//2]
@@ -317,10 +316,11 @@ class V100FlashAttentionBackend(AttentionBackend):
             k_odd = k[:, :, 1::2]  # [num_tokens, kv_num_heads, head_dim//2]
 
             # Apply RoPE formula vectorized
-            q_even_new = q_even * cos_even - q_odd * sin_even
-            q_odd_new = q_odd * cos_even + q_even * sin_even
-            k_even_new = k_even * cos_even - k_odd * sin_even
-            k_odd_new = k_odd * cos_even + k_even * sin_even
+            # cos_expanded/sin_expanded: [num_tokens, 1, head_dim//2] will broadcast
+            q_even_new = q_even * cos_expanded - q_odd * sin_expanded
+            q_odd_new = q_odd * cos_expanded + q_even * sin_expanded
+            k_even_new = k_even * cos_expanded - k_odd * sin_expanded
+            k_odd_new = k_odd * cos_expanded + k_even * sin_expanded
 
             # Interleave back: stack and reshape
             # [num_tokens, num_heads, head_dim//2, 2] -> [num_tokens, num_heads, head_dim]
