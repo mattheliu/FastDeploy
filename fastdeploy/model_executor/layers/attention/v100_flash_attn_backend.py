@@ -672,11 +672,29 @@ class V100FlashAttentionBackend(AttentionBackend):
         # Step 4: Read all KV from cache
         # Use seq_lens_this_time.shape[0] as batch_size to ensure consistency
         batch_size = forward_meta.seq_lens_this_time.shape[0]
-        total_seq_lens = (
-            forward_meta.seq_lens_encoder[:batch_size]
-            + forward_meta.seq_lens_decoder[:batch_size]
-            + forward_meta.seq_lens_this_time
-        )
+
+        # Calculate total sequence lengths for KV cache reading
+        # Key insight:
+        # - Prefill: seq_lens_encoder already includes current tokens (this_time == encoder_len)
+        #   => total = encoder_len (don't add this_time again)
+        # - Decode: this_time is a new token not yet in encoder_len/decoder_len
+        #   => total = encoder_len + decoder_len + this_time
+
+        total_seq_lens = paddle.zeros_like(forward_meta.seq_lens_this_time)
+        for batch_id in range(batch_size):
+            encoder_len = int(forward_meta.seq_lens_encoder[batch_id].item())
+            decoder_len = int(forward_meta.seq_lens_decoder[batch_id].item())
+            this_time_len = int(forward_meta.seq_lens_this_time[batch_id].item())
+
+            # Determine if this is prefill or decode
+            is_prefill = (this_time_len == encoder_len) and (decoder_len == 0)
+
+            if is_prefill:
+                # Prefill: cache has encoder_len tokens
+                total_seq_lens[batch_id] = encoder_len
+            else:
+                # Decode: cache has encoder_len + decoder_len + this_time_len tokens
+                total_seq_lens[batch_id] = encoder_len + decoder_len + this_time_len
 
         k_list, v_list, seq_lens_list, batch_ids = self._read_kv_from_block_cache(
             key_cache,
