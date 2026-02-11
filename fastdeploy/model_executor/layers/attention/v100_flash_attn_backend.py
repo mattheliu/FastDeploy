@@ -220,7 +220,7 @@ class V100FlashAttentionBackend(AttentionBackend):
         batch_id_per_token: paddle.Tensor,
     ):
         """
-        Apply RoPE to Q and K tensors.
+        Apply RoPE to Q and K tensors using vectorized operations.
 
         Args:
             q: Query tensor [num_tokens, num_heads, head_dim]
@@ -238,78 +238,53 @@ class V100FlashAttentionBackend(AttentionBackend):
         num_heads = q.shape[1]
         kv_num_heads = k.shape[1]
         head_dim = q.shape[2]
-        original_dtype = q.dtype  # Save original dtype for casting back
+        original_dtype = q.dtype
 
-        # Determine rotary_embs format
-        # Format: [2, batch, max_seq_len, 1, head_dim//2] or [2, 1, max_seq_len, 1, head_dim//2]
-        has_batch_dim = rotary_embs.shape[1] > 1
-
-        # Track position within each sequence
+        # Calculate positions for each token
+        # positions[i] = seq_lens_encoder[batch_id] + seq_lens_decoder[batch_id] + token_offset_in_batch
+        positions = []
         batch_token_counts = {}
-
-        q_list = []
-        k_list = []
 
         for token_idx in range(num_tokens):
             batch_id = int(batch_id_per_token[token_idx].item())
-
-            # Initialize or increment token count for this batch
             if batch_id not in batch_token_counts:
                 batch_token_counts[batch_id] = 0
 
-            # Calculate position in the full sequence
             encoder_len = int(seq_lens_encoder[batch_id].item())
             decoder_len = int(seq_lens_decoder[batch_id].item())
-            token_pos_in_batch = batch_token_counts[batch_id]
-
-            # Position for RoPE lookup
-            pos = encoder_len + decoder_len + token_pos_in_batch
-
-            # Get cos and sin for this position
-            if has_batch_dim:
-                cos = rotary_embs[0, batch_id, pos, 0, :]  # [head_dim//2]
-                sin = rotary_embs[1, batch_id, pos, 0, :]  # [head_dim//2]
-            else:
-                cos = rotary_embs[0, 0, pos, 0, :]  # [head_dim//2]
-                sin = rotary_embs[1, 0, pos, 0, :]  # [head_dim//2]
-
-            # Expand cos/sin for all heads: [1, head_dim//2] -> [num_heads, head_dim//2]
-            cos_q = cos.unsqueeze(0).tile([num_heads, 1])
-            sin_q = sin.unsqueeze(0).tile([num_heads, 1])
-            cos_k = cos.unsqueeze(0).tile([kv_num_heads, 1])
-            sin_k = sin.unsqueeze(0).tile([kv_num_heads, 1])
-
-            # Get Q and K for this token
-            q_token = q[token_idx]  # [num_heads, head_dim]
-            k_token = k[token_idx]  # [kv_num_heads, head_dim]
-
-            # Apply RoPE (interleaved style)
-            # Split into even and odd parts
-            q_even = q_token[:, 0::2]  # [num_heads, head_dim//2]
-            q_odd = q_token[:, 1::2]  # [num_heads, head_dim//2]
-            k_even = k_token[:, 0::2]  # [kv_num_heads, head_dim//2]
-            k_odd = k_token[:, 1::2]  # [kv_num_heads, head_dim//2]
-
-            # RoPE formula: [x_even, x_odd] * cos + [-x_odd, x_even] * sin
-            q_even_new = q_even * cos_q - q_odd * sin_q
-            q_odd_new = q_odd * cos_q + q_even * sin_q
-            k_even_new = k_even * cos_k - k_odd * sin_k
-            k_odd_new = k_odd * cos_k + k_even * sin_k
-
-            # Interleave back
-            q_with_rope = paddle.stack([q_even_new, q_odd_new], axis=-1).reshape([num_heads, head_dim])
-            k_with_rope = paddle.stack([k_even_new, k_odd_new], axis=-1).reshape([kv_num_heads, head_dim])
-
-            q_list.append(q_with_rope)
-            k_list.append(k_with_rope)
-
+            pos = encoder_len + decoder_len + batch_token_counts[batch_id]
+            positions.append(pos)
             batch_token_counts[batch_id] += 1
 
-        # Stack all tokens back and cast to original dtype
-        q_out = paddle.stack(q_list, axis=0).cast(original_dtype)  # [num_tokens, num_heads, head_dim]
-        k_out = paddle.stack(k_list, axis=0).cast(original_dtype)  # [num_tokens, kv_num_heads, head_dim]
+        positions = paddle.to_tensor(positions, dtype="int64")
 
-        return q_out, k_out
+        # Get cos and sin for all positions at once
+        # rotary_embs shape: [2, 1, max_seq_len, 1, head_dim//2] (non-mm case)
+        cos_all = rotary_embs[0, 0, positions, 0, :]  # [num_tokens, head_dim//2]
+        sin_all = rotary_embs[1, 0, positions, 0, :]  # [num_tokens, head_dim//2]
+
+        # Expand for heads: [num_tokens, 1, head_dim//2] -> broadcast with [num_tokens, num_heads, head_dim//2]
+        cos_q = cos_all.unsqueeze(1)  # [num_tokens, 1, head_dim//2]
+        sin_q = sin_all.unsqueeze(1)  # [num_tokens, 1, head_dim//2]
+
+        # Split Q and K into even and odd parts
+        q_even = q[:, :, 0::2]  # [num_tokens, num_heads, head_dim//2]
+        q_odd = q[:, :, 1::2]  # [num_tokens, num_heads, head_dim//2]
+        k_even = k[:, :, 0::2]  # [num_tokens, kv_num_heads, head_dim//2]
+        k_odd = k[:, :, 1::2]  # [num_tokens, kv_num_heads, head_dim//2]
+
+        # Apply RoPE formula vectorized
+        q_even_new = q_even * cos_q - q_odd * sin_q
+        q_odd_new = q_odd * cos_q + q_even * sin_q
+        k_even_new = k_even * cos_q - k_odd * sin_q
+        k_odd_new = k_odd * cos_q + k_even * sin_q
+
+        # Interleave back: stack and reshape
+        # [num_tokens, num_heads, head_dim//2, 2] -> [num_tokens, num_heads, head_dim]
+        q_out = paddle.stack([q_even_new, q_odd_new], axis=-1).reshape([num_tokens, num_heads, head_dim])
+        k_out = paddle.stack([k_even_new, k_odd_new], axis=-1).reshape([num_tokens, kv_num_heads, head_dim])
+
+        return q_out.cast(original_dtype), k_out.cast(original_dtype)
 
     def _write_kv_to_block_cache(
         self,
