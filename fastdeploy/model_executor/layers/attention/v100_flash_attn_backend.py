@@ -399,8 +399,8 @@ class V100FlashAttentionBackend(AttentionBackend):
 
         This V100 implementation uses a simplified approach:
         1. Split QKV
-        2. Write KV to cache manually
-        3. Read KV from cache
+        2. Write KV to cache (if not dummy run)
+        3. Read KV from cache (or use current K/V for dummy run)
         4. Use scaled_dot_product_attention per sequence (SM70 compatible)
 
         Note: This is less efficient than the SM80+ fused implementation
@@ -415,6 +415,14 @@ class V100FlashAttentionBackend(AttentionBackend):
         kv_num_heads = layer.kv_num_heads
         qk_head_dim = layer.qk_head_dim
         v_head_dim = getattr(layer, "v_head_dim", qk_head_dim)
+
+        # Check if this is a dummy/profile run
+        is_dummy_run = getattr(forward_meta, "is_dummy_or_profile_run", False)
+
+        if is_dummy_run:
+            # For dummy run, use simple attention without KV cache
+            # This avoids block_tables index out of bounds issues
+            return self._simple_attention_forward(q, k, v, num_heads, kv_num_heads, qk_head_dim, v_head_dim)
 
         # Get KV cache from forward_meta.caches
         key_cache = forward_meta.caches[2 * layer.layer_id]
@@ -494,6 +502,56 @@ class V100FlashAttentionBackend(AttentionBackend):
             output = output.reshape([-1, num_heads * v_head_dim])
         else:
             output = paddle.empty([0, num_heads * v_head_dim], dtype=q.dtype)
+
+        return output
+
+    def _simple_attention_forward(
+        self,
+        q: paddle.Tensor,
+        k: paddle.Tensor,
+        v: paddle.Tensor,
+        num_heads: int,
+        kv_num_heads: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+    ) -> paddle.Tensor:
+        """
+        Simple attention forward without KV cache.
+        Used for dummy/profile runs where block_tables may not be properly sized.
+        """
+        num_tokens = q.shape[0]
+
+        # Reshape tensors
+        q_reshaped = q.reshape([num_tokens, num_heads, qk_head_dim])
+        k_reshaped = k.reshape([num_tokens, kv_num_heads, qk_head_dim])
+        v_reshaped = v.reshape([num_tokens, kv_num_heads, qk_head_dim])
+
+        # Expand K and V for GQA if needed
+        if self.group_size > 1:
+            k_reshaped = (
+                k_reshaped.unsqueeze(2).tile([1, 1, self.group_size, 1]).reshape([num_tokens, num_heads, qk_head_dim])
+            )
+            v_reshaped = (
+                v_reshaped.unsqueeze(2).tile([1, 1, self.group_size, 1]).reshape([num_tokens, num_heads, qk_head_dim])
+            )
+
+        # Simple self-attention (treat all tokens as one sequence)
+        # Transpose to [num_heads, num_tokens, head_dim]
+        q_t = q_reshaped.transpose([1, 0, 2])
+        k_t = k_reshaped.transpose([1, 0, 2])
+        v_t = v_reshaped.transpose([1, 0, 2])
+
+        # Add batch dimension
+        q_t = q_t.unsqueeze(0)
+        k_t = k_t.unsqueeze(0)
+        v_t = v_t.unsqueeze(0)
+
+        # Run attention
+        output = scaled_dot_product_attention(q_t, k_t, v_t, is_causal=self.causal)
+
+        # Reshape output
+        output = output.squeeze(0).transpose([1, 0, 2])
+        output = output.reshape([num_tokens, num_heads * v_head_dim])
 
         return output
 
