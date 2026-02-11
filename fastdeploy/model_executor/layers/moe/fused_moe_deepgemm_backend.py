@@ -28,27 +28,48 @@ from fastdeploy.platforms import current_platform
 from fastdeploy.utils import register_custom_python_op
 from fastdeploy.worker.tbo import let_another_thread_run
 
+from ..utils import get_sm_version
 from .fused_moe_backend_base import MoEMethodBase
 from .fused_moe_triton_backend import BlockWiseFP8MoEMethod
 
 if current_platform.is_cuda():
-    try:
-        m_grouped_fp8_gemm_nt_contiguous = (
-            fastdeploy.model_executor.layers.quantization.fp8_utils.deep_gemm.m_grouped_fp8_gemm_nt_contiguous
+    if get_sm_version() == 100:
+        paddle.compat.enable_torch_proxy(scope={"deep_gemm"})
+        from deep_gemm import (
+            m_grouped_fp8_gemm_nt_contiguous,
+            m_grouped_fp8_gemm_nt_masked,
         )
-        m_grouped_fp8_gemm_nt_masked = (
-            fastdeploy.model_executor.layers.quantization.fp8_utils.deep_gemm.m_grouped_fp8_gemm_nt_masked
+    else:
+        from fastdeploy.model_executor.ops.gpu.deep_gemm import (
+            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as m_grouped_fp8_gemm_nt_contiguous,
         )
-    except:
-        m_grouped_fp8_gemm_nt_contiguous = (
-            fastdeploy.model_executor.layers.quantization.fp8_utils.deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
-        )
-        m_grouped_fp8_gemm_nt_masked = (
-            fastdeploy.model_executor.layers.quantization.fp8_utils.deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked
+        from fastdeploy.model_executor.ops.gpu.deep_gemm import (
+            m_grouped_gemm_fp8_fp8_bf16_nt_masked as m_grouped_fp8_gemm_nt_masked,
         )
 else:
     m_grouped_fp8_gemm_nt_contiguous = None
     m_grouped_fp8_gemm_nt_masked = None
+
+
+def _fp8_quant_blockwise_compat(x, using_pow2_scale=False, output_scale_transpose=False, using_ue8m0_scale=False):
+    """
+    Compatibility wrapper for fp8_quant_blockwise that handles older PaddlePaddle versions
+    that don't support the using_ue8m0_scale parameter.
+    """
+    try:
+        return paddle.incubate.nn.functional.fp8_quant_blockwise(
+            x,
+            using_pow2_scale=using_pow2_scale,
+            output_scale_transpose=output_scale_transpose,
+            using_ue8m0_scale=using_ue8m0_scale,
+        )
+    except TypeError:
+        # Older PaddlePaddle version without using_ue8m0_scale support
+        return paddle.incubate.nn.functional.fp8_quant_blockwise(
+            x,
+            using_pow2_scale=using_pow2_scale,
+            output_scale_transpose=output_scale_transpose,
+        )
 
 
 def m_grouped_fp8_gemm_nt_contiguous_custom_python_op_infermeta(
@@ -98,9 +119,6 @@ def m_grouped_fp8_gemm_nt_contiguous_custom_python_op(
         (permute_input.shape[0], layer_added_weight_attrs_0.shape[1]),
         dtype=paddle.bfloat16,
     )
-    if disable_ue8m0_cast:
-        permute_scale = permute_scale.transpose([1, 0]).contiguous()
-        permute_scale = permute_scale.transpose([1, 0])
     # disable_ue8m0_cast is False for SM100
     m_grouped_fp8_gemm_nt_contiguous(
         (permute_input, permute_scale),
@@ -113,20 +131,12 @@ def m_grouped_fp8_gemm_nt_contiguous_custom_python_op(
     ffn_out = paddle.incubate.nn.functional.swiglu(ffn_out)
 
     # down_proj
-    if not fastdeploy.envs.FD_USE_PHI_FP8_QUANT:
-        ffn_in_x, ffn_in_x_scale_tensor = fastdeploy.model_executor.ops.gpu.per_token_quant(
-            ffn_out, quant_config_weight_block_size_0
-        )
-
-        ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0]).contiguous()
-        ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0])
-    else:
-        ffn_in_x, ffn_in_x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
-            ffn_out,
-            using_pow2_scale=not disable_ue8m0_cast,
-            using_ue8m0_scale=not disable_ue8m0_cast,
-        )
-        ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
+    ffn_in_x, ffn_in_x_scale_tensor = _fp8_quant_blockwise_compat(
+        ffn_out,
+        using_pow2_scale=not disable_ue8m0_cast,
+        using_ue8m0_scale=not disable_ue8m0_cast,
+    )
+    ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
 
     ffn_out = paddle.empty(
         (permute_input.shape[0], layer_added_weight_attrs_1.shape[1]),
@@ -269,22 +279,17 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
             topk_ids_hookfunc(topk_ids=topk_idx)
 
         # 2. Dynamic compute blockwise quantization scales
-        if not fastdeploy.envs.FD_USE_PHI_FP8_QUANT:
-            x, x_scale_tensor = fastdeploy.model_executor.ops.gpu.per_token_quant(
-                x, self.quant_config.weight_block_size[0]
-            )
-        else:
-            x, x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
-                x,
-                using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
-                output_scale_transpose=self.quant_config.deepgemm_scale_ue8m0,
-                using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
-            )
-            x_scale_tensor = (
-                x_scale_tensor[: x.shape[0]]
-                if not self.quant_config.deepgemm_scale_ue8m0
-                else x_scale_tensor.T[: x.shape[0]]
-            )
+        x, x_scale_tensor = _fp8_quant_blockwise_compat(
+            x,
+            using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
+            output_scale_transpose=self.quant_config.deepgemm_scale_ue8m0,
+            using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
+        )
+        x_scale_tensor = (
+            x_scale_tensor[: x.shape[0]]
+            if not self.quant_config.deepgemm_scale_ue8m0
+            else x_scale_tensor.T[: x.shape[0]]
+        )
 
         event = deep_ep.Buffer.capture()
         let_another_thread_run()
@@ -338,6 +343,7 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
                 token_all_num,
             )
             assert permute_input.shape[0] == token_all_num
+            del recv_x
 
             if not self.quant_config.deepgemm_scale_ue8m0:
                 permute_scale = permute_scale.transpose([1, 0]).contiguous().transpose([1, 0])
@@ -360,18 +366,12 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
             ffn_out = paddle.incubate.nn.functional.swiglu(ffn_out, None)
 
             # down_proj
-            if not fastdeploy.envs.FD_USE_PHI_FP8_QUANT:
-                ffn_in_x, ffn_in_x_scale_tensor = fastdeploy.model_executor.ops.gpu.per_token_quant(
-                    ffn_out, self.quant_config.weight_block_size[0]
-                )
-                ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.transpose([1, 0]).contiguous().transpose([1, 0])
-            else:
-                ffn_in_x, ffn_in_x_scale_tensor = paddle.incubate.nn.functional.fp8_quant_blockwise(
-                    ffn_out,
-                    using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
-                    using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
-                )
-                ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
+            ffn_in_x, ffn_in_x_scale_tensor = _fp8_quant_blockwise_compat(
+                ffn_out,
+                using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
+                using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
+            )
+            ffn_in_x_scale_tensor = ffn_in_x_scale_tensor.T[: ffn_in_x.shape[0]]
 
             del ffn_out
             ffn_out = paddle.empty(
@@ -464,9 +464,10 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
             token_nums_per_expert,
             expected_m,
         )
+        act_out = fastdeploy.model_executor.ops.gpu.group_swiglu_with_masked(up_gate_proj_out, token_nums_per_expert)
 
-        act_out_fp8, scale = fastdeploy.model_executor.ops.gpu.fused_mask_swiglu_fp8_quant(
-            up_gate_proj_out,
+        act_out_fp8, scale = fastdeploy.model_executor.ops.gpu.masked_per_token_quant(
+            act_out,
             token_nums_per_expert,
             self.quant_config.weight_block_size[0],
             use_ue8m0=self.quant_config.deepgemm_scale_ue8m0,
@@ -523,22 +524,17 @@ class DeepGemmFusedMoeMethod(MoEMethodBase):
 
         tmp = count_tokens_per_expert_func(topk_ids, layer.num_experts)
 
-        if not fastdeploy.envs.FD_USE_PHI_FP8_QUANT:
-            recv_x, recv_x_scale = fastdeploy.model_executor.ops.gpu.per_token_quant(x, 128)
-        else:
-
-            recv_x, recv_x_scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
-                x,
-                using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
-                output_scale_transpose=self.quant_config.deepgemm_scale_ue8m0,
-                using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
-            )
-            recv_x_scale = (
-                recv_x_scale[: recv_x.shape[0]]
-                if not self.quant_config.deepgemm_scale_ue8m0
-                else recv_x_scale.T[: recv_x.shape[0]]
-            )
-
+        recv_x, recv_x_scale = _fp8_quant_blockwise_compat(
+            x,
+            using_pow2_scale=self.quant_config.deepgemm_scale_ue8m0,
+            output_scale_transpose=self.quant_config.deepgemm_scale_ue8m0,
+            using_ue8m0_scale=self.quant_config.deepgemm_scale_ue8m0,
+        )
+        recv_x_scale = (
+            recv_x_scale[: recv_x.shape[0]]
+            if not self.quant_config.deepgemm_scale_ue8m0
+            else recv_x_scale.T[: recv_x.shape[0]]
+        )
         (
             permute_input,
             permute_scale,
