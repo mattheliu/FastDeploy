@@ -246,25 +246,6 @@ class V100FlashAttentionBackend(AttentionBackend):
         original_dtype = q.dtype
         forward_meta_seq_lens_this_time = seq_lens_this_time
 
-        # Debug: print shapes on first call
-        if not hasattr(self, "_rope_debug_printed"):
-            logger.info(f"[V100 RoPE Debug] q.shape={q.shape}, k.shape={k.shape}, head_dim={head_dim}")
-            logger.info(
-                f"[V100 RoPE Debug] rotary_embs.shape={rotary_embs.shape}, use_neox_rotary_style={use_neox_rotary_style}"
-            )
-            self._rope_debug_printed = True
-
-        # Debug: print positions for first few calls
-        if not hasattr(self, "_rope_debug_count"):
-            self._rope_debug_count = 0
-        if self._rope_debug_count < 10:
-            logger.info(
-                f"[V100 RoPE Debug #{self._rope_debug_count}] num_tokens={num_tokens}, "
-                f"seq_lens_encoder={seq_lens_encoder.tolist()[:4]}, "
-                f"seq_lens_decoder={seq_lens_decoder.tolist()[:4]}, "
-                f"seq_lens_this_time={seq_lens_this_time.tolist()[:4] if seq_lens_this_time is not None else None}"
-            )
-
         # Calculate positions for each token
         # The position for each token is determined by:
         # - seq_lens_encoder: total encoder tokens (for prefill, this includes current tokens)
@@ -308,11 +289,6 @@ class V100FlashAttentionBackend(AttentionBackend):
             batch_token_counts[batch_id] += 1
 
         positions = paddle.to_tensor(positions, dtype="int64")
-
-        # Debug: print positions for first few calls
-        if self._rope_debug_count < 10:
-            logger.info(f"[V100 RoPE Debug #{self._rope_debug_count}] positions={positions.tolist()}")
-            self._rope_debug_count += 1
 
         # Get cos and sin for all positions at once
         # rotary_embs shape: [2, 1, max_seq_len, 1, rotary_dim]
@@ -700,26 +676,6 @@ class V100FlashAttentionBackend(AttentionBackend):
             else:
                 # Decode: cache has encoder_len + decoder_len + this_time_len tokens
                 total_seq_lens[batch_id] = encoder_len + decoder_len + this_time_len
-
-        # Debug: log decode phase info
-        if not hasattr(self, "_decode_debug_count"):
-            self._decode_debug_count = 0
-        if self._decode_debug_count < 5:
-            is_decode = any(
-                (int(forward_meta.seq_lens_this_time[i].item()) != int(forward_meta.seq_lens_encoder[i].item()))
-                or (int(forward_meta.seq_lens_decoder[i].item()) > 0)
-                for i in range(batch_size)
-                if int(forward_meta.seq_lens_this_time[i].item()) > 0
-            )
-            if is_decode:
-                logger.info(
-                    f"[V100 Decode Debug #{self._decode_debug_count}] "
-                    f"total_seq_lens={total_seq_lens.tolist()}, "
-                    f"encoder={forward_meta.seq_lens_encoder.tolist()[:4]}, "
-                    f"decoder={forward_meta.seq_lens_decoder.tolist()[:4]}, "
-                    f"this_time={forward_meta.seq_lens_this_time.tolist()[:4]}"
-                )
-                self._decode_debug_count += 1
 
         k_list, v_list, seq_lens_list, batch_ids = self._read_kv_from_block_cache(
             key_cache,

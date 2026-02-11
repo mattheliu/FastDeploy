@@ -127,6 +127,15 @@ class CUDAPlatform(Platform):
             return False
 
     @classmethod
+    def supports_cudagraph_with_attention(cls) -> bool:
+        """
+        Check if the current GPU supports CUDA graph with the attention backend.
+        V100 (SM70) uses a Python-based attention implementation that is not
+        compatible with CUDA graph capture/replay.
+        """
+        return cls.supports_async_copy()  # SM80+ supports CUDA graph with fused kernels
+
+    @classmethod
     def get_attention_backend_cls(cls, selected_backend: _Backend):
         """
         get_attention_backend_cls with automatic fallback for SM70 (V100)
