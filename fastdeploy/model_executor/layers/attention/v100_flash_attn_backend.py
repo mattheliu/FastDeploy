@@ -301,25 +301,42 @@ class V100FlashAttentionBackend(AttentionBackend):
         sin_expanded = sin_all.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
 
         if use_neox_rotary_style:
-            # Neox style: rotate first half and second half separately
-            # x = [x1, x2], rotate_half(x) = [-x2, x1]
+            # Neox style (split half): split q/k into first half and second half
+            # x = [x1, x2] where x1 = x[:, :, :half], x2 = x[:, :, half:]
+            # rotate_half(x) = [-x2, x1]
             # output = x * cos + rotate_half(x) * sin
-            rotary_dim = cos_all.shape[-1]  # head_dim // 2
+            #
+            # For Qwen3: rotary_embs shape is [2, 1, max_seq_len, 1, head_dim]
+            # cos/sin are already head_dim, need to use first half for rotation
+            rotary_dim = cos_all.shape[-1]
+            half_dim = head_dim // 2
 
-            q_rot = q[:, :, :rotary_dim]
-            q_pass = q[:, :, rotary_dim:]
-            k_rot = k[:, :, :rotary_dim]
-            k_pass = k[:, :, rotary_dim:]
+            # Split Q and K into first half and second half
+            q1 = q[:, :, :half_dim]  # [num_tokens, num_heads, head_dim//2]
+            q2 = q[:, :, half_dim:]  # [num_tokens, num_heads, head_dim//2]
+            k1 = k[:, :, :half_dim]  # [num_tokens, kv_num_heads, head_dim//2]
+            k2 = k[:, :, half_dim:]  # [num_tokens, kv_num_heads, head_dim//2]
 
-            # For neox: cos/sin shape is [num_tokens, 1, head_dim//2]
-            # We need to tile it for the rotation
-            q_rot_new = q_rot * cos_expanded - q_pass * sin_expanded
-            q_pass_new = q_pass * cos_expanded + q_rot * sin_expanded
-            k_rot_new = k_rot * cos_expanded - k_pass * sin_expanded
-            k_pass_new = k_pass * cos_expanded + k_rot * sin_expanded
+            # cos/sin from rotary_embs - may be head_dim or head_dim//2 depending on model
+            # Slice to head_dim//2 for the rotation
+            if rotary_dim == head_dim:
+                # Full head_dim cos/sin, need to slice
+                cos_half = cos_expanded[:, :, :half_dim]  # [num_tokens, 1, head_dim//2]
+                sin_half = sin_expanded[:, :, :half_dim]  # [num_tokens, 1, head_dim//2]
+            else:
+                # Already head_dim//2
+                cos_half = cos_expanded
+                sin_half = sin_expanded
 
-            q_out = paddle.concat([q_rot_new, q_pass_new], axis=-1)
-            k_out = paddle.concat([k_rot_new, k_pass_new], axis=-1)
+            # Apply rotation: [q1, q2] * cos + [-q2, q1] * sin
+            # = [q1*cos - q2*sin, q2*cos + q1*sin]
+            q1_new = q1 * cos_half - q2 * sin_half
+            q2_new = q2 * cos_half + q1 * sin_half
+            k1_new = k1 * cos_half - k2 * sin_half
+            k2_new = k2 * cos_half + k1 * sin_half
+
+            q_out = paddle.concat([q1_new, q2_new], axis=-1)
+            k_out = paddle.concat([k1_new, k2_new], axis=-1)
         else:
             # Interleaved style (use_neox_rotary_style=False):
             # For each pair (x_even, x_odd), apply rotation:
