@@ -334,6 +334,8 @@ class V100FlashAttentionBackend(AttentionBackend):
         """
         Run scaled dot-product attention for a single sequence.
 
+        Uses manual implementation to avoid Paddle's GQA head count validation.
+
         Args:
             query: [q_len, num_heads, head_dim]
             key: [kv_len, num_heads, head_dim] (already expanded for GQA)
@@ -345,41 +347,41 @@ class V100FlashAttentionBackend(AttentionBackend):
         """
         q_len = query.shape[0]
         kv_len = key.shape[0]
+        head_dim = query.shape[2]
 
-        # Transpose to [num_heads, seq_len, head_dim] for attention
+        # Transpose to [num_heads, seq_len, head_dim]
         q = query.transpose([1, 0, 2])  # [num_heads, q_len, head_dim]
         k = key.transpose([1, 0, 2])  # [num_heads, kv_len, head_dim]
         v = value.transpose([1, 0, 2])  # [num_heads, kv_len, head_dim]
 
-        # Add batch dimension: [1, num_heads, seq_len, head_dim]
-        q = q.unsqueeze(0)
-        k = k.unsqueeze(0)
-        v = v.unsqueeze(0)
+        # Compute attention scores: [num_heads, q_len, kv_len]
+        scale = head_dim**-0.5
+        scores = paddle.matmul(q, k.transpose([0, 2, 1])) * scale
 
-        # Use Paddle's scaled_dot_product_attention
-        # Note: For prefill with causal, we need to handle the case where q_len != kv_len
-        if is_causal and q_len == kv_len:
-            output = scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            # For decode or non-causal, or when q_len != kv_len
-            # We need to manually create causal mask for prefill
-            if is_causal and q_len != kv_len:
-                # Create causal mask for the case where q_len < kv_len
-                # The mask should allow attending to positions [kv_len - q_len, kv_len)
-                # with causal constraint
-                attn_mask = paddle.zeros([q_len, kv_len], dtype=q.dtype)
-                for i in range(q_len):
-                    # Position in the full sequence
-                    pos = kv_len - q_len + i
-                    # Can only attend to positions <= pos
-                    attn_mask[i, pos + 1 :] = -1e9
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, q_len, kv_len]
-                output = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # Apply causal mask if needed
+        if is_causal:
+            # Create causal mask
+            # For prefill: mask positions where query position < key position
+            # For decode (q_len=1): mask future positions
+            if q_len == kv_len:
+                # Standard causal mask for prefill
+                mask = paddle.triu(paddle.full([q_len, kv_len], float("-inf"), dtype=scores.dtype), diagonal=1)
             else:
-                output = scaled_dot_product_attention(q, k, v, is_causal=False)
+                # For decode or partial prefill
+                # Query at position i can attend to key positions 0 to (kv_len - q_len + i)
+                mask = paddle.zeros([q_len, kv_len], dtype=scores.dtype)
+                for i in range(q_len):
+                    pos = kv_len - q_len + i
+                    if pos + 1 < kv_len:
+                        mask[i, pos + 1 :] = float("-inf")
+            scores = scores + mask.unsqueeze(0)
 
-        # Remove batch dimension and transpose back: [q_len, num_heads, head_dim]
-        output = output.squeeze(0).transpose([1, 0, 2])
+        # Softmax and output
+        attn_weights = paddle.nn.functional.softmax(scores, axis=-1)
+        output = paddle.matmul(attn_weights, v)  # [num_heads, q_len, head_dim]
+
+        # Transpose back to [q_len, num_heads, head_dim]
+        output = output.transpose([1, 0, 2])
 
         return output
 
