@@ -218,6 +218,7 @@ class V100FlashAttentionBackend(AttentionBackend):
         seq_lens_encoder: paddle.Tensor,
         seq_lens_decoder: paddle.Tensor,
         batch_id_per_token: paddle.Tensor,
+        seq_lens_this_time: paddle.Tensor,
         use_neox_rotary_style: bool = False,
     ):
         """
@@ -231,6 +232,7 @@ class V100FlashAttentionBackend(AttentionBackend):
             seq_lens_encoder: Encoder sequence lengths [batch_size]
             seq_lens_decoder: Decoder sequence lengths [batch_size]
             batch_id_per_token: Batch ID for each token [num_tokens]
+            seq_lens_this_time: Tokens being processed this time [batch_size]
             use_neox_rotary_style: Whether to use neox style (half rotation) or interleaved style
 
         Returns:
@@ -242,6 +244,7 @@ class V100FlashAttentionBackend(AttentionBackend):
         kv_num_heads = k.shape[1]
         head_dim = q.shape[2]
         original_dtype = q.dtype
+        forward_meta_seq_lens_this_time = seq_lens_this_time
 
         # Debug: print shapes on first call
         if not hasattr(self, "_rope_debug_printed"):
@@ -263,7 +266,15 @@ class V100FlashAttentionBackend(AttentionBackend):
             self._rope_debug_count += 1
 
         # Calculate positions for each token
-        # positions[i] = seq_lens_encoder[batch_id] + seq_lens_decoder[batch_id] + token_offset_in_batch
+        # The position for each token is determined by:
+        # - seq_lens_encoder: total encoder tokens (includes current prefill tokens)
+        # - seq_lens_decoder: total decoder tokens generated so far
+        # - seq_lens_this_time: tokens being processed in this call
+        #
+        # For prefill: seq_lens_encoder already includes current tokens, so we need to subtract seq_lens_this_time
+        # For decode: seq_lens_this_time = 1, positions start at seq_lens_encoder + seq_lens_decoder
+        #
+        # Position formula: (seq_lens_encoder - seq_lens_this_time) + seq_lens_decoder + token_offset_in_batch
         positions = []
         batch_token_counts = {}
 
@@ -274,7 +285,15 @@ class V100FlashAttentionBackend(AttentionBackend):
 
             encoder_len = int(seq_lens_encoder[batch_id].item())
             decoder_len = int(seq_lens_decoder[batch_id].item())
-            pos = encoder_len + decoder_len + batch_token_counts[batch_id]
+            this_time_len = (
+                int(forward_meta_seq_lens_this_time[batch_id].item())
+                if forward_meta_seq_lens_this_time is not None
+                else 0
+            )
+            # Position = (encoder_len - this_time_len) + decoder_len + offset
+            # This ensures prefill tokens get positions 0, 1, 2, ...
+            # And decode tokens get positions encoder_len + decoder_len, encoder_len + decoder_len + 1, ...
+            pos = (encoder_len - this_time_len) + decoder_len + batch_token_counts[batch_id]
             positions.append(pos)
             batch_token_counts[batch_id] += 1
 
@@ -388,13 +407,18 @@ class V100FlashAttentionBackend(AttentionBackend):
             if batch_id not in batch_token_counts:
                 batch_token_counts[batch_id] = 0
 
-            # Calculate position in the full sequence (encoder + decoder + current)
+            # Calculate position in the full sequence
+            # seq_lens_encoder includes current tokens, so we subtract seq_lens_this_time
             encoder_len = int(seq_lens_encoder[batch_id].item())
             decoder_len = int(seq_lens_decoder[batch_id].item())
+            this_time_len = int(seq_lens_this_time[batch_id].item())
             token_pos_in_batch = batch_token_counts[batch_id]
 
-            # The position in the full context
-            full_seq_pos = encoder_len + decoder_len + token_pos_in_batch
+            # The position in the full context:
+            # (encoder_len - this_time_len) gives the tokens before current batch
+            # decoder_len is tokens already decoded
+            # token_pos_in_batch is offset within current batch
+            full_seq_pos = (encoder_len - this_time_len) + decoder_len + token_pos_in_batch
 
             # Calculate block index and offset within block
             block_idx = full_seq_pos // self.block_size
@@ -605,6 +629,7 @@ class V100FlashAttentionBackend(AttentionBackend):
                 forward_meta.seq_lens_encoder,
                 forward_meta.seq_lens_decoder,
                 forward_meta.batch_id_per_token,
+                forward_meta.seq_lens_this_time,
                 use_neox_rotary_style,
             )
 
