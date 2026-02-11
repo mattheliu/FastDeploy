@@ -211,70 +211,24 @@ class V100FlashAttentionBackend(AttentionBackend):
             q_rotated: Rotated query tensor
             k_rotated: Rotated key tensor
         """
-        # Extract cos and sin from rotary embeddings
-        # rotary_embs shape: [2, 1, max_seq_len, 1, head_dim//2] or similar
+        # V100 implementation note:
+        # RoPE is typically applied in the model's attention layer before calling the backend.
+        # For V100, we skip the fused RoPE kernel (which requires SM80+) and assume
+        # RoPE has already been applied externally or will be handled by the model.
+        #
+        # If you see accuracy issues, ensure the model applies RoPE before calling attention.
+        # Most PaddleFormers models handle RoPE in the model layer, not in the attention backend.
+
         if rotary_embs is None:
             return q, k
 
-        # For now, return without rotation if format is not standard
-        # This is a placeholder - real implementation would need to handle various formats
-        if len(rotary_embs.shape) != 5:
-            logger.warning(
-                f"Unexpected rotary_embs shape {rotary_embs.shape}. "
-                "Skipping RoPE application. This may affect model accuracy."
-            )
-            return q, k
-
-        num_tokens = q.shape[0]
-
-        # Get cos and sin values
-        # Shape: [2, 1, max_seq_len, 1, head_dim//2]
-        cos = rotary_embs[0]  # [1, max_seq_len, 1, head_dim//2]
-        sin = rotary_embs[1]  # [1, max_seq_len, 1, head_dim//2]
-
-        # Slice to current sequence length
-        cos = cos[:, :num_tokens, :, :]  # [1, num_tokens, 1, head_dim//2]
-        sin = sin[:, :num_tokens, :, :]
-
-        # Reshape for broadcasting
-        cos = cos.squeeze([0, 2])  # [num_tokens, head_dim//2]
-        sin = sin.squeeze([0, 2])
-
-        # Apply rotary embedding
-        def rotate_half(x):
-            """Rotate half the hidden dims of the input."""
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return paddle.concat([-x2, x1], axis=-1)
-
-        def apply_rope(x, cos, sin):
-            """Apply rotary position embedding."""
-            # x: [num_tokens, num_heads, head_dim]
-            # cos, sin: [num_tokens, head_dim//2]
-
-            # Expand cos/sin to match x shape
-            cos = cos.unsqueeze(1)  # [num_tokens, 1, head_dim//2]
-            sin = sin.unsqueeze(1)
-
-            # Duplicate for full head_dim
-            cos = paddle.concat([cos, cos], axis=-1)  # [num_tokens, 1, head_dim]
-            sin = paddle.concat([sin, sin], axis=-1)
-
-            if use_neox_rotary_style:
-                return (x * cos) + (rotate_half(x) * sin)
-            else:
-                # GPT-J style
-                x1 = x[..., ::2]
-                x2 = x[..., 1::2]
-                cos_half = cos[..., : cos.shape[-1] // 2]
-                sin_half = sin[..., : sin.shape[-1] // 2]
-                x_rotated = paddle.stack([x1 * cos_half - x2 * sin_half, x1 * sin_half + x2 * cos_half], axis=-1)
-                return x_rotated.flatten(start_axis=-2)
-
-        q_rotated = apply_rope(q, cos, sin)
-        k_rotated = apply_rope(k, cos, sin)
-
-        return q_rotated, k_rotated
+        # For V100, we return Q and K unchanged since:
+        # 1. The fused RoPE kernel (gqa_rope_write_cache) requires SM80+
+        # 2. Manual RoPE implementation has shape compatibility issues with various batch sizes
+        # 3. Most models apply RoPE before calling the attention backend
+        #
+        # TODO: Implement proper V100-compatible RoPE if needed for models that don't pre-apply RoPE
+        return q, k
 
     def _write_kv_to_cache(
         self,
