@@ -227,6 +227,7 @@ class ModelConfig:
 
         self.partial_rotary_factor: float = 1.0
         self.num_nextn_predict_layers = 0
+        self.mm_max_tokens_per_item = None
         for key, value in args.items():
             if hasattr(self, key) and value != "None":
                 setattr(self, key, value)
@@ -327,6 +328,24 @@ class ModelConfig:
         self.override_name_from_config()
         self.read_from_env()
         self.read_model_config()
+        self._adjust_dtype_for_hardware()
+
+    def _adjust_dtype_for_hardware(self):
+        """
+        Automatically adjust dtype based on hardware capabilities.
+        On V100 (SM70), BF16 is not supported, so we fall back to FP16.
+        """
+        if current_platform.is_cuda():
+            from fastdeploy.platforms.cuda import CUDAPlatform
+
+            original_dtype = self.dtype
+            self.dtype = CUDAPlatform.get_recommended_dtype(self.dtype)
+
+            if original_dtype != self.dtype:
+                logger.info(
+                    f"Dtype adjusted from '{original_dtype}' to '{self.dtype}' "
+                    f"based on hardware capabilities (SM{CUDAPlatform.get_sm_version()})."
+                )
 
     @property
     def registry(self):
@@ -1225,6 +1244,7 @@ class LoadConfig:
         args,
     ):
         self.load_choices: Union[str, LoadChoices] = LoadChoices.DEFAULT.value
+        self.is_pre_sharded: bool = False
         self.dynamic_load_weight: bool = False
         self.load_strategy: Optional[Literal["ipc", "ipc_snapshot", "meta", "normal", "rsync"]] = "normal"
         self.rsync_config: Optional[Dict[str, Any]] = None
@@ -1833,7 +1853,7 @@ class FDConfig:
             self.long_prefill_token_threshold = int(self.model_config.max_model_len * 0.04)
 
         self.cache_config.max_block_num_per_seq = int(self.model_config.max_model_len // self.cache_config.block_size)
-        self.cache_config.postprocess(self.scheduler_config.max_num_batched_tokens, self.scheduler_config.max_num_seqs)
+        self.cache_config.postprocess(self.get_max_chunk_tokens(), self.scheduler_config.max_num_seqs)
         if self.model_config is not None and self.model_config.enable_mm and not envs.ENABLE_V1_KVCACHE_SCHEDULER:
             self.cache_config.enable_prefix_caching = False
         if self.routing_replay_config is not None and self.routing_replay_config.enable_routing_replay:
@@ -1893,6 +1913,16 @@ class FDConfig:
             logger.info(
                 "Current Platform can not support CUDAGraph, CUDAGraph currently only support on GPU/XPU/Metax GPU !"
             )
+
+        # Disable CUDA graph for V100 (SM70) as it uses Python-based attention
+        # that is not compatible with CUDA graph capture/replay
+        if current_platform.is_cuda() and hasattr(current_platform, "supports_cudagraph_with_attention"):
+            if not current_platform.supports_cudagraph_with_attention() and self.graph_opt_config.use_cudagraph:
+                self.graph_opt_config.use_cudagraph = False
+                logger.warning(
+                    "V100 (SM70) uses Python-based attention backend that is not compatible with CUDA graph. "
+                    "Automatically disabling CUDA graph for correct results."
+                )
 
         # adjust speculative config
         if self.speculative_config is not None and self.speculative_config.method == "mtp":
@@ -2145,6 +2175,31 @@ class FDConfig:
             "return_full_hidden_states",
         )
         reset_value(self.cache_config, "cache_dtype", "infer_model_dtype")
+
+    def get_max_chunk_tokens(self, mm_max_tokens_per_item=None):
+        """
+        get max chunk tokens
+
+        The maximum tokens size of a single inference in a multimodal model is influenced by the logic of chunking
+        """
+        if mm_max_tokens_per_item is None:
+            mm_max_tokens_per_item = self.model_config.mm_max_tokens_per_item
+
+        if self.scheduler_config.splitwise_role == "decode":
+            if paddle.is_compiled_with_xpu():
+                num_tokens = self.scheduler_config.max_num_batched_tokens
+            else:
+                num_tokens = self.scheduler_config.max_num_seqs
+        else:
+            num_tokens = self.scheduler_config.max_num_batched_tokens
+            if mm_max_tokens_per_item is not None:
+                max_mm_tokens = max(
+                    mm_max_tokens_per_item.get("image", 0),
+                    mm_max_tokens_per_item.get("video", 0),
+                    mm_max_tokens_per_item.get("audio", 0),
+                )
+                num_tokens = min(num_tokens + max_mm_tokens, self.model_config.max_model_len)
+        return num_tokens
 
     def _check_master(self):
         return self.is_master

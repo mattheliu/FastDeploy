@@ -20,13 +20,21 @@ import paddle
 
 from fastdeploy.platforms import current_platform
 
+# append_attention requires SM80+ (uses cp.async instructions)
+append_attention_gpu = None
+append_attention_with_output_gpu = None
+
 if current_platform.is_cuda():
-    from fastdeploy.model_executor.ops.gpu import (
-        append_attention as append_attention_gpu,
-    )
-    from fastdeploy.model_executor.ops.gpu import (
-        append_attention_with_output as append_attention_with_output_gpu,
-    )
+    try:
+        from fastdeploy.model_executor.ops.gpu import (
+            append_attention as append_attention_gpu,
+        )
+        from fastdeploy.model_executor.ops.gpu import (
+            append_attention_with_output as append_attention_with_output_gpu,
+        )
+    except ImportError:
+        # append_attention is not available on SM70 (V100)
+        pass
 
 
 def append_attention(
@@ -88,6 +96,11 @@ def append_attention(
     append_attention
     """
     if current_platform.is_cuda():
+        if append_attention_gpu is None:
+            raise NotImplementedError(
+                "append_attention is not available on this GPU architecture (requires SM80+). "
+                "V100 (SM70) does not support this operation."
+            )
         out = append_attention_gpu(
             qkv,
             key_cache,
@@ -211,6 +224,11 @@ def append_attention_with_output(
     append_attention
     """
     if current_platform.is_cuda():
+        if append_attention_with_output_gpu is None:
+            raise NotImplementedError(
+                "append_attention_with_output is not available on this GPU architecture (requires SM80+). "
+                "V100 (SM70) does not support this operation."
+            )
         return append_attention_with_output_gpu(
             qkv,
             key_cache,

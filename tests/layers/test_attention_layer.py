@@ -56,6 +56,17 @@ if "nvidia graphics device" in paddle.device.cuda.get_device_name().lower():
     os.environ.setdefault("DG_NVCC_OVERRIDE_CPP_STANDARD", "17")
 
 
+def _check_fp8_support():
+    """Check if current GPU supports FP8 (SM89+)."""
+    try:
+        prop = paddle.device.cuda.get_device_properties()
+        sm_version = prop.major * 10 + prop.minor
+        return sm_version >= 89
+    except Exception:
+        return False
+
+
+@unittest.skipIf(not _check_fp8_support(), "FP8 quantization requires SM89+ (Ada Lovelace or newer)")
 class TestAttentionPerformance(unittest.TestCase):
     def setUp(self):
         """
@@ -99,6 +110,7 @@ class TestAttentionPerformance(unittest.TestCase):
         model_args = {"model": model_path, "dtype": "bfloat16"}
         model_config = ModelConfig(model_args)
         model_config.tensor_parallel_size = tensor_parallel_size
+        model_config.mm_max_tokens_per_item = None
         parallel_config = ParallelConfig({"tensor_parallel_size": tensor_parallel_size, "data_parallel_size": 1})
         cache_config = CacheConfig(
             {
