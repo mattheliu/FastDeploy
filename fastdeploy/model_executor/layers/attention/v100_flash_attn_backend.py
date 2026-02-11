@@ -50,6 +50,28 @@ if TYPE_CHECKING:
     from fastdeploy.model_executor.forward_meta import ForwardMeta
 
 
+def _apply_rope(qk: paddle.Tensor, cos: paddle.Tensor, sin: paddle.Tensor) -> paddle.Tensor:
+    """
+    Apply Rotary Position Embedding (RoPE) to query or key tensor.
+
+    Args:
+        qk: Query or Key tensor [seq_len, num_heads, head_dim]
+        cos: Cosine values [seq_len, 1, head_dim] or [seq_len, 1, head_dim//2]
+        sin: Sine values [seq_len, 1, head_dim] or [seq_len, 1, head_dim//2]
+
+    Returns:
+        Tensor with RoPE applied [seq_len, num_heads, head_dim]
+    """
+    # Interleaved rotation: rotate pairs of elements
+    # rotate_half: [..., x1, x0, x3, x2, ...] -> [..., -x1, x0, -x3, x2, ...]
+    rotate_half = paddle.reshape(
+        paddle.stack([-qk[..., 1::2], qk[..., 0::2]], axis=-1),
+        paddle.shape(qk),
+    )
+    out = paddle.add(paddle.multiply(qk, cos), paddle.multiply(rotate_half, sin))
+    return paddle.cast(out, qk.dtype)
+
+
 @dataclass
 class V100FlashAttentionMetadata(AttentionMetadata):
     """
@@ -187,6 +209,106 @@ class V100FlashAttentionBackend(AttentionBackend):
         v = qkv[:, q_size + kv_size :]
 
         return q, k, v
+
+    def _apply_rope_to_qk(
+        self,
+        q: paddle.Tensor,
+        k: paddle.Tensor,
+        rotary_embs: paddle.Tensor,
+        seq_lens_encoder: paddle.Tensor,
+        seq_lens_decoder: paddle.Tensor,
+        batch_id_per_token: paddle.Tensor,
+    ):
+        """
+        Apply RoPE to Q and K tensors.
+
+        Args:
+            q: Query tensor [num_tokens, num_heads, head_dim]
+            k: Key tensor [num_tokens, kv_num_heads, head_dim]
+            rotary_embs: Rotary embeddings [2, batch, max_seq_len, 1, head_dim//2] or [2, 1, max_seq_len, 1, head_dim//2]
+            seq_lens_encoder: Encoder sequence lengths [batch_size]
+            seq_lens_decoder: Decoder sequence lengths [batch_size]
+            batch_id_per_token: Batch ID for each token [num_tokens]
+
+        Returns:
+            q_with_rope: Query with RoPE applied [num_tokens, num_heads, head_dim]
+            k_with_rope: Key with RoPE applied [num_tokens, kv_num_heads, head_dim]
+        """
+        num_tokens = q.shape[0]
+        num_heads = q.shape[1]
+        kv_num_heads = k.shape[1]
+        head_dim = q.shape[2]
+
+        # Determine rotary_embs format
+        # Format: [2, batch, max_seq_len, 1, head_dim//2] or [2, 1, max_seq_len, 1, head_dim//2]
+        has_batch_dim = rotary_embs.shape[1] > 1
+
+        # Track position within each sequence
+        batch_token_counts = {}
+
+        q_list = []
+        k_list = []
+
+        for token_idx in range(num_tokens):
+            batch_id = int(batch_id_per_token[token_idx].item())
+
+            # Initialize or increment token count for this batch
+            if batch_id not in batch_token_counts:
+                batch_token_counts[batch_id] = 0
+
+            # Calculate position in the full sequence
+            encoder_len = int(seq_lens_encoder[batch_id].item())
+            decoder_len = int(seq_lens_decoder[batch_id].item())
+            token_pos_in_batch = batch_token_counts[batch_id]
+
+            # Position for RoPE lookup
+            pos = encoder_len + decoder_len + token_pos_in_batch
+
+            # Get cos and sin for this position
+            if has_batch_dim:
+                cos = rotary_embs[0, batch_id, pos, 0, :]  # [head_dim//2]
+                sin = rotary_embs[1, batch_id, pos, 0, :]  # [head_dim//2]
+            else:
+                cos = rotary_embs[0, 0, pos, 0, :]  # [head_dim//2]
+                sin = rotary_embs[1, 0, pos, 0, :]  # [head_dim//2]
+
+            # Expand cos/sin for all heads: [1, head_dim//2] -> [num_heads, head_dim//2]
+            cos_q = cos.unsqueeze(0).tile([num_heads, 1])
+            sin_q = sin.unsqueeze(0).tile([num_heads, 1])
+            cos_k = cos.unsqueeze(0).tile([kv_num_heads, 1])
+            sin_k = sin.unsqueeze(0).tile([kv_num_heads, 1])
+
+            # Get Q and K for this token
+            q_token = q[token_idx]  # [num_heads, head_dim]
+            k_token = k[token_idx]  # [kv_num_heads, head_dim]
+
+            # Apply RoPE (interleaved style)
+            # Split into even and odd parts
+            q_even = q_token[:, 0::2]  # [num_heads, head_dim//2]
+            q_odd = q_token[:, 1::2]  # [num_heads, head_dim//2]
+            k_even = k_token[:, 0::2]  # [kv_num_heads, head_dim//2]
+            k_odd = k_token[:, 1::2]  # [kv_num_heads, head_dim//2]
+
+            # RoPE formula: [x_even, x_odd] * cos + [-x_odd, x_even] * sin
+            q_even_new = q_even * cos_q - q_odd * sin_q
+            q_odd_new = q_odd * cos_q + q_even * sin_q
+            k_even_new = k_even * cos_k - k_odd * sin_k
+            k_odd_new = k_odd * cos_k + k_even * sin_k
+
+            # Interleave back
+            q_with_rope = paddle.stack([q_even_new, q_odd_new], axis=-1).reshape([num_heads, head_dim])
+            k_with_rope = paddle.stack([k_even_new, k_odd_new], axis=-1).reshape([kv_num_heads, head_dim])
+
+            q_list.append(q_with_rope)
+            k_list.append(k_with_rope)
+
+            batch_token_counts[batch_id] += 1
+
+        # Stack all tokens back
+        q_out = paddle.stack(q_list, axis=0)  # [num_tokens, num_heads, head_dim]
+        k_out = paddle.stack(k_list, axis=0)  # [num_tokens, kv_num_heads, head_dim]
+
+        return q_out, k_out
 
     def _write_kv_to_block_cache(
         self,
@@ -404,9 +526,10 @@ class V100FlashAttentionBackend(AttentionBackend):
 
         This V100 implementation uses a simplified approach:
         1. Split QKV
-        2. Write KV to cache (if not dummy run)
-        3. Read KV from cache (or use current K/V for dummy run)
-        4. Use scaled_dot_product_attention per sequence (SM70 compatible)
+        2. Apply RoPE to Q and K
+        3. Write KV to cache (if not dummy run)
+        4. Read KV from cache (or use current K/V for dummy run)
+        5. Use scaled_dot_product_attention per sequence (SM70 compatible)
 
         Note: This is less efficient than the SM80+ fused implementation
         but provides full functionality on V100.
@@ -429,14 +552,34 @@ class V100FlashAttentionBackend(AttentionBackend):
             # This avoids block_tables index out of bounds issues
             return self._simple_attention_forward(q, k, v, num_heads, kv_num_heads, qk_head_dim, v_head_dim)
 
+        # Step 2: Apply RoPE to Q and K
+        # Reshape Q and K for RoPE application
+        q_reshaped = q.reshape([num_tokens, num_heads, qk_head_dim])
+        k_reshaped = k.reshape([num_tokens, kv_num_heads, qk_head_dim])
+
+        # Apply RoPE if rotary_embs is available
+        if forward_meta.rotary_embs is not None:
+            q_reshaped, k_reshaped = self._apply_rope_to_qk(
+                q_reshaped,
+                k_reshaped,
+                forward_meta.rotary_embs,
+                forward_meta.seq_lens_encoder,
+                forward_meta.seq_lens_decoder,
+                forward_meta.batch_id_per_token,
+            )
+
+        # Reshape back for cache write
+        k_with_rope = k_reshaped.reshape([num_tokens, kv_num_heads * qk_head_dim])
+        v_flat = v  # V doesn't need RoPE
+
         # Get KV cache from forward_meta.caches
         key_cache = forward_meta.caches[2 * layer.layer_id]
         value_cache = forward_meta.caches[2 * layer.layer_id + 1]
 
-        # Step 2: Write KV to cache
+        # Step 3: Write KV to cache (with RoPE already applied to K)
         self._write_kv_to_block_cache(
-            k,
-            v,
+            k_with_rope,
+            v_flat,
             key_cache,
             value_cache,
             forward_meta.block_tables,
@@ -448,7 +591,7 @@ class V100FlashAttentionBackend(AttentionBackend):
             qk_head_dim,
         )
 
-        # Step 3: Read all KV from cache
+        # Step 4: Read all KV from cache
         # Use seq_lens_this_time.shape[0] as batch_size to ensure consistency
         batch_size = forward_meta.seq_lens_this_time.shape[0]
         total_seq_lens = (
@@ -467,10 +610,10 @@ class V100FlashAttentionBackend(AttentionBackend):
             qk_head_dim,
         )
 
-        # Step 4: Reshape Q for attention
-        q_reshaped = q.reshape([num_tokens, num_heads, qk_head_dim])
+        # Step 5: Use Q with RoPE applied (q_reshaped already has RoPE if available)
+        # Note: q_reshaped was already set to [num_tokens, num_heads, qk_head_dim] with RoPE above
 
-        # Step 5: Run attention per sequence
+        # Step 6: Run attention per sequence
         output_list = []
         token_start = 0
 
