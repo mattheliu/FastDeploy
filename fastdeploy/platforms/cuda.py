@@ -135,16 +135,23 @@ class CUDAPlatform(Platform):
 
         # Check for SM70 (V100) compatibility and apply fallbacks
         if not cls.supports_async_copy():
-            # APPEND_ATTN, MLA_ATTN, and FLASH_ATTN all require SM80+ (cp.async or dependent ops)
-            # V100 can use V100_FLASH_ATTN which is optimized for SM70
-            if selected_backend in (_Backend.APPEND_ATTN, _Backend.MLA_ATTN, _Backend.FLASH_ATTN):
+            # APPEND_ATTN, MLA_ATTN, FLASH_ATTN, and V100_FLASH_ATTN all require SM80+
+            # - APPEND_ATTN/MLA_ATTN: require cp.async instructions
+            # - FLASH_ATTN/V100_FLASH_ATTN: flash_attn_unpadded requires SM80+
+            # V100 must use NATIVE_ATTN which uses scaled_dot_product_attention
+            if selected_backend in (
+                _Backend.APPEND_ATTN,
+                _Backend.MLA_ATTN,
+                _Backend.FLASH_ATTN,
+                _Backend.V100_FLASH_ATTN,
+            ):
                 logger.warning(
                     f"{selected_backend} backend requires SM{cls.SM_ASYNC_COPY_MIN}+ "
-                    f"(cp.async instructions or dependent ops), "
+                    f"(flash_attn_unpadded or cp.async instructions), "
                     f"but current GPU is SM{sm_version}. "
-                    f"Automatically falling back to V100_FLASH_ATTN backend."
+                    f"Automatically falling back to NATIVE_ATTN backend."
                 )
-                selected_backend = _Backend.V100_FLASH_ATTN
+                selected_backend = _Backend.NATIVE_ATTN
 
         if selected_backend == _Backend.NATIVE_ATTN:
             logger.info("Using NATIVE ATTN backend.")
