@@ -251,6 +251,17 @@ class V100FlashAttentionBackend(AttentionBackend):
             )
             self._rope_debug_printed = True
 
+        # Debug: print positions for first few calls
+        if not hasattr(self, "_rope_debug_count"):
+            self._rope_debug_count = 0
+        if self._rope_debug_count < 5:
+            logger.info(
+                f"[V100 RoPE Debug #{self._rope_debug_count}] num_tokens={num_tokens}, "
+                f"seq_lens_encoder={seq_lens_encoder.tolist()[:4]}, "
+                f"seq_lens_decoder={seq_lens_decoder.tolist()[:4]}"
+            )
+            self._rope_debug_count += 1
+
         # Calculate positions for each token
         # positions[i] = seq_lens_encoder[batch_id] + seq_lens_decoder[batch_id] + token_offset_in_batch
         positions = []
