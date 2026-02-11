@@ -238,6 +238,7 @@ class V100FlashAttentionBackend(AttentionBackend):
         num_heads = q.shape[1]
         kv_num_heads = k.shape[1]
         head_dim = q.shape[2]
+        original_dtype = q.dtype  # Save original dtype for casting back
 
         # Determine rotary_embs format
         # Format: [2, batch, max_seq_len, 1, head_dim//2] or [2, 1, max_seq_len, 1, head_dim//2]
@@ -304,9 +305,9 @@ class V100FlashAttentionBackend(AttentionBackend):
 
             batch_token_counts[batch_id] += 1
 
-        # Stack all tokens back
-        q_out = paddle.stack(q_list, axis=0)  # [num_tokens, num_heads, head_dim]
-        k_out = paddle.stack(k_list, axis=0)  # [num_tokens, kv_num_heads, head_dim]
+        # Stack all tokens back and cast to original dtype
+        q_out = paddle.stack(q_list, axis=0).cast(original_dtype)  # [num_tokens, num_heads, head_dim]
+        k_out = paddle.stack(k_list, axis=0).cast(original_dtype)  # [num_tokens, kv_num_heads, head_dim]
 
         return q_out, k_out
 
