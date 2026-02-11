@@ -701,6 +701,26 @@ class V100FlashAttentionBackend(AttentionBackend):
                 # Decode: cache has encoder_len + decoder_len + this_time_len tokens
                 total_seq_lens[batch_id] = encoder_len + decoder_len + this_time_len
 
+        # Debug: log decode phase info
+        if not hasattr(self, "_decode_debug_count"):
+            self._decode_debug_count = 0
+        if self._decode_debug_count < 5:
+            is_decode = any(
+                (int(forward_meta.seq_lens_this_time[i].item()) != int(forward_meta.seq_lens_encoder[i].item()))
+                or (int(forward_meta.seq_lens_decoder[i].item()) > 0)
+                for i in range(batch_size)
+                if int(forward_meta.seq_lens_this_time[i].item()) > 0
+            )
+            if is_decode:
+                logger.info(
+                    f"[V100 Decode Debug #{self._decode_debug_count}] "
+                    f"total_seq_lens={total_seq_lens.tolist()}, "
+                    f"encoder={forward_meta.seq_lens_encoder.tolist()[:4]}, "
+                    f"decoder={forward_meta.seq_lens_decoder.tolist()[:4]}, "
+                    f"this_time={forward_meta.seq_lens_this_time.tolist()[:4]}"
+                )
+                self._decode_debug_count += 1
+
         k_list, v_list, seq_lens_list, batch_ids = self._read_kv_from_block_cache(
             key_cache,
             value_cache,
