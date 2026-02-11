@@ -257,13 +257,13 @@ class V100FlashAttentionBackend(AttentionBackend):
         # Debug: print positions for first few calls
         if not hasattr(self, "_rope_debug_count"):
             self._rope_debug_count = 0
-        if self._rope_debug_count < 5:
+        if self._rope_debug_count < 10:
             logger.info(
                 f"[V100 RoPE Debug #{self._rope_debug_count}] num_tokens={num_tokens}, "
                 f"seq_lens_encoder={seq_lens_encoder.tolist()[:4]}, "
-                f"seq_lens_decoder={seq_lens_decoder.tolist()[:4]}"
+                f"seq_lens_decoder={seq_lens_decoder.tolist()[:4]}, "
+                f"seq_lens_this_time={seq_lens_this_time.tolist()[:4] if seq_lens_this_time is not None else None}"
             )
-            self._rope_debug_count += 1
 
         # Calculate positions for each token
         # The position for each token is determined by:
@@ -308,6 +308,11 @@ class V100FlashAttentionBackend(AttentionBackend):
             batch_token_counts[batch_id] += 1
 
         positions = paddle.to_tensor(positions, dtype="int64")
+
+        # Debug: print positions for first few calls
+        if self._rope_debug_count < 10:
+            logger.info(f"[V100 RoPE Debug #{self._rope_debug_count}] positions={positions.tolist()}")
+            self._rope_debug_count += 1
 
         # Get cos and sin for all positions at once
         # rotary_embs shape: [2, 1, max_seq_len, 1, rotary_dim]
