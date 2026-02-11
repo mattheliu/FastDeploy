@@ -481,8 +481,13 @@ class V100FlashAttentionBackend(AttentionBackend):
         v = value.transpose([1, 0, 2])  # [num_heads, kv_len, head_dim]
 
         # Compute attention scores: [num_heads, q_len, kv_len]
+        # Use float32 for numerical stability
+        original_dtype = q.dtype
+        q_f32 = q.cast("float32")
+        k_f32 = k.cast("float32")
+
         scale = head_dim**-0.5
-        scores = paddle.matmul(q, k.transpose([0, 2, 1])) * scale
+        scores = paddle.matmul(q_f32, k_f32.transpose([0, 2, 1])) * scale
 
         # Apply causal mask if needed
         if is_causal:
@@ -504,10 +509,11 @@ class V100FlashAttentionBackend(AttentionBackend):
 
         # Softmax and output
         attn_weights = paddle.nn.functional.softmax(scores, axis=-1)
-        output = paddle.matmul(attn_weights, v)  # [num_heads, q_len, head_dim]
+        v_f32 = v.cast("float32")
+        output = paddle.matmul(attn_weights, v_f32)  # [num_heads, q_len, head_dim]
 
-        # Transpose back to [q_len, num_heads, head_dim]
-        output = output.transpose([1, 0, 2])
+        # Transpose back to [q_len, num_heads, head_dim] and cast back
+        output = output.transpose([1, 0, 2]).cast(original_dtype)
 
         return output
 
