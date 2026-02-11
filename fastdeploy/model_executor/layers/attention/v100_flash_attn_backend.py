@@ -218,6 +218,7 @@ class V100FlashAttentionBackend(AttentionBackend):
         seq_lens_encoder: paddle.Tensor,
         seq_lens_decoder: paddle.Tensor,
         batch_id_per_token: paddle.Tensor,
+        use_neox_rotary_style: bool = False,
     ):
         """
         Apply RoPE to Q and K tensors using vectorized operations.
@@ -225,10 +226,12 @@ class V100FlashAttentionBackend(AttentionBackend):
         Args:
             q: Query tensor [num_tokens, num_heads, head_dim]
             k: Key tensor [num_tokens, kv_num_heads, head_dim]
-            rotary_embs: Rotary embeddings [2, batch, max_seq_len, 1, head_dim//2] or [2, 1, max_seq_len, 1, head_dim//2]
+            rotary_embs: Rotary embeddings [2, 1, max_seq_len, 1, head_dim] for interleaved style
+                         or [2, 1, max_seq_len, 1, head_dim//2] for neox style
             seq_lens_encoder: Encoder sequence lengths [batch_size]
             seq_lens_decoder: Decoder sequence lengths [batch_size]
             batch_id_per_token: Batch ID for each token [num_tokens]
+            use_neox_rotary_style: Whether to use neox style (half rotation) or interleaved style
 
         Returns:
             q_with_rope: Query with RoPE applied [num_tokens, num_heads, head_dim]
@@ -239,6 +242,14 @@ class V100FlashAttentionBackend(AttentionBackend):
         kv_num_heads = k.shape[1]
         head_dim = q.shape[2]
         original_dtype = q.dtype
+
+        # Debug: print shapes on first call
+        if not hasattr(self, "_rope_debug_printed"):
+            logger.info(f"[V100 RoPE Debug] q.shape={q.shape}, k.shape={k.shape}, head_dim={head_dim}")
+            logger.info(
+                f"[V100 RoPE Debug] rotary_embs.shape={rotary_embs.shape}, use_neox_rotary_style={use_neox_rotary_style}"
+            )
+            self._rope_debug_printed = True
 
         # Calculate positions for each token
         # positions[i] = seq_lens_encoder[batch_id] + seq_lens_decoder[batch_id] + token_offset_in_batch
@@ -259,30 +270,62 @@ class V100FlashAttentionBackend(AttentionBackend):
         positions = paddle.to_tensor(positions, dtype="int64")
 
         # Get cos and sin for all positions at once
-        # rotary_embs shape: [2, 1, max_seq_len, 1, head_dim//2] (non-mm case)
-        cos_all = rotary_embs[0, 0, positions, 0, :]  # [num_tokens, head_dim//2]
-        sin_all = rotary_embs[1, 0, positions, 0, :]  # [num_tokens, head_dim//2]
+        # rotary_embs shape: [2, 1, max_seq_len, 1, rotary_dim]
+        # where rotary_dim = head_dim for interleaved, head_dim//2 for neox
+        cos_all = rotary_embs[0, 0, positions, 0, :]  # [num_tokens, rotary_dim]
+        sin_all = rotary_embs[1, 0, positions, 0, :]  # [num_tokens, rotary_dim]
 
-        # Expand for heads: [num_tokens, 1, head_dim//2] -> broadcast with [num_tokens, num_heads, head_dim//2]
-        cos_q = cos_all.unsqueeze(1)  # [num_tokens, 1, head_dim//2]
-        sin_q = sin_all.unsqueeze(1)  # [num_tokens, 1, head_dim//2]
+        # Expand for heads: [num_tokens, 1, rotary_dim]
+        cos_expanded = cos_all.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
+        sin_expanded = sin_all.unsqueeze(1)  # [num_tokens, 1, rotary_dim]
 
-        # Split Q and K into even and odd parts
-        q_even = q[:, :, 0::2]  # [num_tokens, num_heads, head_dim//2]
-        q_odd = q[:, :, 1::2]  # [num_tokens, num_heads, head_dim//2]
-        k_even = k[:, :, 0::2]  # [num_tokens, kv_num_heads, head_dim//2]
-        k_odd = k[:, :, 1::2]  # [num_tokens, kv_num_heads, head_dim//2]
+        if use_neox_rotary_style:
+            # Neox style: rotate first half and second half separately
+            # x = [x1, x2], rotate_half(x) = [-x2, x1]
+            # output = x * cos + rotate_half(x) * sin
+            rotary_dim = cos_all.shape[-1]  # head_dim // 2
 
-        # Apply RoPE formula vectorized
-        q_even_new = q_even * cos_q - q_odd * sin_q
-        q_odd_new = q_odd * cos_q + q_even * sin_q
-        k_even_new = k_even * cos_q - k_odd * sin_q
-        k_odd_new = k_odd * cos_q + k_even * sin_q
+            q_rot = q[:, :, :rotary_dim]
+            q_pass = q[:, :, rotary_dim:]
+            k_rot = k[:, :, :rotary_dim]
+            k_pass = k[:, :, rotary_dim:]
 
-        # Interleave back: stack and reshape
-        # [num_tokens, num_heads, head_dim//2, 2] -> [num_tokens, num_heads, head_dim]
-        q_out = paddle.stack([q_even_new, q_odd_new], axis=-1).reshape([num_tokens, num_heads, head_dim])
-        k_out = paddle.stack([k_even_new, k_odd_new], axis=-1).reshape([num_tokens, kv_num_heads, head_dim])
+            # For neox: cos/sin shape is [num_tokens, 1, head_dim//2]
+            # We need to tile it for the rotation
+            q_rot_new = q_rot * cos_expanded - q_pass * sin_expanded
+            q_pass_new = q_pass * cos_expanded + q_rot * sin_expanded
+            k_rot_new = k_rot * cos_expanded - k_pass * sin_expanded
+            k_pass_new = k_pass * cos_expanded + k_rot * sin_expanded
+
+            q_out = paddle.concat([q_rot_new, q_pass_new], axis=-1)
+            k_out = paddle.concat([k_rot_new, k_pass_new], axis=-1)
+        else:
+            # Interleaved style (use_neox_rotary_style=False):
+            # For each pair (x_even, x_odd), apply rotation:
+            # x_even_new = x_even * cos - x_odd * sin
+            # x_odd_new = x_odd * cos + x_even * sin
+            # cos/sin have shape [num_tokens, 1, head_dim], take every other element
+
+            # cos_expanded shape: [num_tokens, 1, head_dim]
+            cos_even = cos_expanded[:, :, 0::2]  # [num_tokens, 1, head_dim//2]
+            sin_even = sin_expanded[:, :, 0::2]  # [num_tokens, 1, head_dim//2]
+
+            # Split Q and K into even and odd parts
+            q_even = q[:, :, 0::2]  # [num_tokens, num_heads, head_dim//2]
+            q_odd = q[:, :, 1::2]  # [num_tokens, num_heads, head_dim//2]
+            k_even = k[:, :, 0::2]  # [num_tokens, kv_num_heads, head_dim//2]
+            k_odd = k[:, :, 1::2]  # [num_tokens, kv_num_heads, head_dim//2]
+
+            # Apply RoPE formula vectorized
+            q_even_new = q_even * cos_even - q_odd * sin_even
+            q_odd_new = q_odd * cos_even + q_even * sin_even
+            k_even_new = k_even * cos_even - k_odd * sin_even
+            k_odd_new = k_odd * cos_even + k_even * sin_even
+
+            # Interleave back: stack and reshape
+            # [num_tokens, num_heads, head_dim//2, 2] -> [num_tokens, num_heads, head_dim]
+            q_out = paddle.stack([q_even_new, q_odd_new], axis=-1).reshape([num_tokens, num_heads, head_dim])
+            k_out = paddle.stack([k_even_new, k_odd_new], axis=-1).reshape([num_tokens, kv_num_heads, head_dim])
 
         return q_out.cast(original_dtype), k_out.cast(original_dtype)
 
@@ -539,6 +582,9 @@ class V100FlashAttentionBackend(AttentionBackend):
         q_reshaped = q.reshape([num_tokens, num_heads, qk_head_dim])
         k_reshaped = k.reshape([num_tokens, kv_num_heads, qk_head_dim])
 
+        # Get RoPE style from layer
+        use_neox_rotary_style = getattr(layer, "use_neox_rotary_style", False)
+
         # Apply RoPE if rotary_embs is available
         if forward_meta.rotary_embs is not None:
             q_reshaped, k_reshaped = self._apply_rope_to_qk(
@@ -548,6 +594,7 @@ class V100FlashAttentionBackend(AttentionBackend):
                 forward_meta.seq_lens_encoder,
                 forward_meta.seq_lens_decoder,
                 forward_meta.batch_id_per_token,
+                use_neox_rotary_style,
             )
 
         # Reshape back for cache write
